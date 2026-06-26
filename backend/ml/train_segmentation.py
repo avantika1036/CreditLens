@@ -78,21 +78,22 @@ def train(engine):
     if len(df) == 0:
         raise ValueError("No customers with churn_risk_score found. Run train_churn.py first.")
 
-    X = df[FEATURE_COLS].copy()
+    X = df[FEATURE_COLS].copy().astype(np.float64)
     X = X.fillna(X.median(numeric_only=True))
 
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
+    X_scaled = scaler.fit_transform(X).astype(np.float64)
 
     print(f"[Segmentation] Training KMeans with {N_CLUSTERS} clusters ...")
     kmeans = KMeans(
-        n_clusters=N_CLUSTERS,
-        init="k-means++",
-        n_init=20,
-        max_iter=500,
-        random_state=42
+    n_clusters=N_CLUSTERS,
+    init="k-means++",
+    n_init=20,
+    max_iter=500,
+    random_state=42
     )
     kmeans.fit(X_scaled)
+    kmeans.cluster_centers_ = kmeans.cluster_centers_.astype(np.float64)
     df["raw_cluster"] = kmeans.labels_
 
     centers_raw = scaler.inverse_transform(kmeans.cluster_centers_)

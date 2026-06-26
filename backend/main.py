@@ -1,8 +1,7 @@
-# backend/main.py
-
 import os
 import pickle
 import numpy as np
+import pandas as pd
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +11,7 @@ from sqlalchemy import text
 
 from db.database import get_engine, init_db
 from reports.pdf_generator import generate_report
+
 
 MODEL_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 REPORT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "reports")
@@ -107,7 +107,7 @@ class CustomerInput(BaseModel):
     card_category:           int   = Field(default=0, example=0)
 
 
-# ── Root & Health ────────────────────────────────────────────────────────────
+# ── Root & Health ─────────────────────────────────────────────────────────────
 
 @app.get("/", tags=["Root"])
 def root():
@@ -133,7 +133,7 @@ def health():
     }
 
 
-# ── Predictions ──────────────────────────────────────────────────────────────
+# ── Predictions ───────────────────────────────────────────────────────────────
 
 @app.post("/predict/risk", tags=["Predictions"])
 def predict_risk(customer: CustomerInput):
@@ -146,6 +146,7 @@ def predict_risk(customer: CustomerInput):
     if kmeans_model is None:
         raise HTTPException(status_code=503, detail="KMeans model not loaded.")
 
+    # ── Churn prediction ──────────────────────────────────────────────────────
     churn_feature_cols = state.get("churn_features", [])
     input_map = {
         "age":                    customer.age,
@@ -163,12 +164,12 @@ def predict_risk(customer: CustomerInput):
         "card_category":          float(customer.card_category),
     }
 
-    churn_vec = np.array(
-        [input_map.get(f, 0.0) for f in churn_feature_cols],
-        dtype=np.float32
-    ).reshape(1, -1)
+    # Use DataFrame so feature names match what the model was trained on
+    churn_df = pd.DataFrame([{
+        f: input_map.get(f, 0.0) for f in churn_feature_cols
+    }])
 
-    churn_prob = float(churn_model.predict_proba(churn_vec)[0][1])
+    churn_prob = float(churn_model.predict_proba(churn_df)[0][1])
 
     if churn_prob >= 0.70:
         risk_level = "HIGH"
@@ -177,6 +178,7 @@ def predict_risk(customer: CustomerInput):
     else:
         risk_level = "LOW"
 
+    # ── Segmentation prediction ───────────────────────────────────────────────
     kmeans_feature_cols = state.get("kmeans_features", [])
     kmeans_input_map = {
         "credit_limit":           customer.credit_limit,
@@ -187,15 +189,17 @@ def predict_risk(customer: CustomerInput):
         "churn_risk_score":       churn_prob,
     }
 
-    kmeans_vec = np.array(
-        [kmeans_input_map.get(f, 0.0) for f in kmeans_feature_cols],
-        dtype=np.float32
-    ).reshape(1, -1)
+    # Use DataFrame to preserve feature names through StandardScaler
+    kmeans_df = pd.DataFrame([{
+        f: kmeans_input_map.get(f, 0.0) for f in kmeans_feature_cols
+    }])
 
-    kmeans_vec_scaled = kmeans_scaler.transform(kmeans_vec)
-    segment_id        = int(kmeans_model.predict(kmeans_vec_scaled)[0])
-    segment_label     = SEGMENT_MAP.get(segment_id, "Unknown")
-    recommendation    = RECOMMENDATIONS.get(segment_id, "Monitor account activity.")
+    # Cast to float32 after scaling to match dtype KMeans was trained with
+        # Cast to float64 after scaling to match KMeans cluster centers dtype
+    kmeans_vec_scaled = kmeans_scaler.transform(kmeans_df).astype(np.float64)
+    segment_id    = int(kmeans_model.predict(kmeans_vec_scaled)[0])
+    segment_label = SEGMENT_MAP.get(segment_id, "Unknown")
+    recommendation = RECOMMENDATIONS.get(segment_id, "Monitor account activity.")
 
     return {
         "churn_risk_score": round(churn_prob, 4),
@@ -206,7 +210,7 @@ def predict_risk(customer: CustomerInput):
     }
 
 
-# ── Legacy Stats (kept for backward compat) ──────────────────────────────────
+# ── Stats ─────────────────────────────────────────────────────────────────────
 
 @app.get("/stats/summary", tags=["Stats"])
 def stats_summary():
@@ -282,15 +286,8 @@ def stats_fraud(limit: int = 100):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── New Endpoints ─────────────────────────────────────────────────────────────
-
 @app.get("/stats/overview", tags=["Stats"])
 def stats_overview():
-    """
-    Returns a high-level KPI summary:
-    total_customers, avg_churn_risk, high_risk_count,
-    actual_churned, fraud_flagged_transactions.
-    """
     engine = state.get("engine")
     try:
         with engine.connect() as conn:
@@ -303,16 +300,16 @@ def stats_overview():
                 FROM customers
             """)).fetchone()
 
-            fraud_row = conn.execute(text("""
-                SELECT COUNT(*) FROM transactions WHERE fraud_flag = TRUE
-            """)).fetchone()
+            fraud_row = conn.execute(text(
+                "SELECT COUNT(*) FROM transactions WHERE fraud_flag = TRUE"
+            )).fetchone()
 
         return {
-            "total_customers":             int(cust_row[0])   if cust_row[0]   else 0,
-            "avg_churn_risk":              float(cust_row[1]) if cust_row[1]   else 0.0,
-            "high_risk_count":             int(cust_row[2])   if cust_row[2]   else 0,
-            "actual_churned":              int(cust_row[3])   if cust_row[3]   else 0,
-            "fraud_flagged_transactions":  int(fraud_row[0])  if fraud_row[0]  else 0,
+            "total_customers":            int(cust_row[0])   if cust_row[0]  else 0,
+            "avg_churn_risk":             float(cust_row[1]) if cust_row[1]  else 0.0,
+            "high_risk_count":            int(cust_row[2])   if cust_row[2]  else 0,
+            "actual_churned":             int(cust_row[3])   if cust_row[3]  else 0,
+            "fraud_flagged_transactions": int(fraud_row[0])  if fraud_row[0] else 0,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -320,10 +317,6 @@ def stats_overview():
 
 @app.get("/stats/segments", tags=["Stats"])
 def stats_segments():
-    """
-    Returns per-segment breakdown:
-    segment_label, count, avg_churn_risk, avg_credit_limit.
-    """
     engine = state.get("engine")
     try:
         with engine.connect() as conn:
@@ -356,11 +349,6 @@ def stats_segments():
 
 @app.get("/stats/top-risk", tags=["Stats"])
 def stats_top_risk(limit: int = Query(default=20, ge=1, le=500)):
-    """
-    Returns top N customers sorted by churn_risk_score descending.
-    Includes customer_id, age, segment_label, credit_limit,
-    total_trans_amt, churn_risk_score, is_churned.
-    """
     engine = state.get("engine")
     try:
         with engine.connect() as conn:
@@ -404,12 +392,10 @@ def stats_top_risk(limit: int = Query(default=20, ge=1, le=500)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── SHAP ──────────────────────────────────────────────────────────────────────
+
 @app.get("/shap/{customer_id}", tags=["SHAP"])
 def shap_by_customer(customer_id: int, limit: int = Query(default=10, ge=1, le=50)):
-    """
-    Returns top SHAP features for a given customer_id,
-    sorted by absolute SHAP value descending.
-    """
     engine = state.get("engine")
     try:
         with engine.connect() as conn:
@@ -443,14 +429,15 @@ def shap_by_customer(customer_id: int, limit: int = Query(default=10, ge=1, le=5
             for r in rows
         ]
 
-        churn_score = None
+        churn_score   = None
+        segment_label = None
         with engine.connect() as conn:
             score_row = conn.execute(text(
                 "SELECT churn_risk_score, segment_label FROM customers WHERE customer_id = :cid"
             ), {"cid": customer_id}).fetchone()
             if score_row:
-                churn_score    = float(score_row[0]) if score_row[0] else None
-                segment_label  = score_row[1]
+                churn_score   = float(score_row[0]) if score_row[0] else None
+                segment_label = score_row[1]
 
         return {
             "customer_id":      customer_id,
