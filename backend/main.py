@@ -4,7 +4,7 @@ import os
 import pickle
 import numpy as np
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -107,6 +107,8 @@ class CustomerInput(BaseModel):
     card_category:           int   = Field(default=0, example=0)
 
 
+# ── Root & Health ────────────────────────────────────────────────────────────
+
 @app.get("/", tags=["Root"])
 def root():
     return {"status": "ok", "project": "CreditLens"}
@@ -131,11 +133,13 @@ def health():
     }
 
 
+# ── Predictions ──────────────────────────────────────────────────────────────
+
 @app.post("/predict/risk", tags=["Predictions"])
 def predict_risk(customer: CustomerInput):
-    churn_model  = state.get("churn_model")
-    kmeans_model = state.get("kmeans_model")
-    kmeans_scaler= state.get("kmeans_scaler")
+    churn_model   = state.get("churn_model")
+    kmeans_model  = state.get("kmeans_model")
+    kmeans_scaler = state.get("kmeans_scaler")
 
     if churn_model is None:
         raise HTTPException(status_code=503, detail="Churn model not loaded.")
@@ -164,7 +168,7 @@ def predict_risk(customer: CustomerInput):
         dtype=np.float32
     ).reshape(1, -1)
 
-    churn_prob  = float(churn_model.predict_proba(churn_vec)[0][1])
+    churn_prob = float(churn_model.predict_proba(churn_vec)[0][1])
 
     if churn_prob >= 0.70:
         risk_level = "HIGH"
@@ -201,6 +205,8 @@ def predict_risk(customer: CustomerInput):
         "recommendation":   recommendation,
     }
 
+
+# ── Legacy Stats (kept for backward compat) ──────────────────────────────────
 
 @app.get("/stats/summary", tags=["Stats"])
 def stats_summary():
@@ -276,28 +282,189 @@ def stats_fraud(limit: int = 100):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── New Endpoints ─────────────────────────────────────────────────────────────
+
+@app.get("/stats/overview", tags=["Stats"])
+def stats_overview():
+    """
+    Returns a high-level KPI summary:
+    total_customers, avg_churn_risk, high_risk_count,
+    actual_churned, fraud_flagged_transactions.
+    """
+    engine = state.get("engine")
+    try:
+        with engine.connect() as conn:
+            cust_row = conn.execute(text("""
+                SELECT
+                    COUNT(*)                                                      AS total_customers,
+                    ROUND(AVG(churn_risk_score)::numeric, 4)                     AS avg_churn_risk,
+                    SUM(CASE WHEN churn_risk_score > 0.7  THEN 1 ELSE 0 END)     AS high_risk_count,
+                    SUM(CASE WHEN is_churned = TRUE       THEN 1 ELSE 0 END)     AS actual_churned
+                FROM customers
+            """)).fetchone()
+
+            fraud_row = conn.execute(text("""
+                SELECT COUNT(*) FROM transactions WHERE fraud_flag = TRUE
+            """)).fetchone()
+
+        return {
+            "total_customers":             int(cust_row[0])   if cust_row[0]   else 0,
+            "avg_churn_risk":              float(cust_row[1]) if cust_row[1]   else 0.0,
+            "high_risk_count":             int(cust_row[2])   if cust_row[2]   else 0,
+            "actual_churned":              int(cust_row[3])   if cust_row[3]   else 0,
+            "fraud_flagged_transactions":  int(fraud_row[0])  if fraud_row[0]  else 0,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/stats/segments", tags=["Stats"])
 def stats_segments():
+    """
+    Returns per-segment breakdown:
+    segment_label, count, avg_churn_risk, avg_credit_limit.
+    """
     engine = state.get("engine")
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT segment_id, segment_label,
-                       COUNT(*) AS count,
-                       ROUND(AVG(churn_risk_score)::numeric, 4) AS avg_churn_risk,
-                       ROUND(AVG(credit_limit)::numeric, 2)     AS avg_credit_limit,
-                       ROUND(AVG(total_trans_amt)::numeric, 2)  AS avg_trans_amt
+                SELECT
+                    segment_label,
+                    COUNT(*)                                        AS count,
+                    ROUND(AVG(churn_risk_score)::numeric, 4)       AS avg_risk,
+                    ROUND(AVG(credit_limit)::numeric, 2)           AS avg_credit_limit
                 FROM customers
                 WHERE segment_label IS NOT NULL
-                GROUP BY segment_id, segment_label
-                ORDER BY segment_id
+                GROUP BY segment_label
+                ORDER BY avg_risk DESC
             """)).fetchall()
-        keys = ["segment_id", "segment_label", "count",
-                "avg_churn_risk", "avg_credit_limit", "avg_trans_amt"]
-        return {"segments": [dict(zip(keys, r)) for r in rows]}
+
+        return {
+            "segments": [
+                {
+                    "segment":          r[0],
+                    "count":            int(r[1]),
+                    "avg_risk":         float(r[2]) if r[2] else 0.0,
+                    "avg_credit_limit": float(r[3]) if r[3] else 0.0,
+                }
+                for r in rows
+            ]
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/stats/top-risk", tags=["Stats"])
+def stats_top_risk(limit: int = Query(default=20, ge=1, le=500)):
+    """
+    Returns top N customers sorted by churn_risk_score descending.
+    Includes customer_id, age, segment_label, credit_limit,
+    total_trans_amt, churn_risk_score, is_churned.
+    """
+    engine = state.get("engine")
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT
+                    customer_id,
+                    age,
+                    segment_label,
+                    credit_limit,
+                    total_trans_amt,
+                    avg_utilization_ratio,
+                    churn_risk_score,
+                    is_churned
+                FROM customers
+                WHERE churn_risk_score IS NOT NULL
+                ORDER BY churn_risk_score DESC
+                LIMIT :limit
+            """), {"limit": limit}).fetchall()
+
+        keys = [
+            "customer_id", "age", "segment_label", "credit_limit",
+            "total_trans_amt", "avg_utilization_ratio",
+            "churn_risk_score", "is_churned"
+        ]
+        customers = []
+        for r in rows:
+            rec = dict(zip(keys, r))
+            rec["churn_risk_score"]      = float(rec["churn_risk_score"]) if rec["churn_risk_score"] else 0.0
+            rec["credit_limit"]          = float(rec["credit_limit"])     if rec["credit_limit"]     else 0.0
+            rec["total_trans_amt"]       = float(rec["total_trans_amt"])  if rec["total_trans_amt"]  else 0.0
+            rec["avg_utilization_ratio"] = float(rec["avg_utilization_ratio"]) if rec["avg_utilization_ratio"] else 0.0
+            rec["risk_level"] = (
+                "HIGH"   if rec["churn_risk_score"] >= 0.70 else
+                "MEDIUM" if rec["churn_risk_score"] >= 0.40 else
+                "LOW"
+            )
+            customers.append(rec)
+
+        return {"limit": limit, "customers": customers}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/shap/{customer_id}", tags=["SHAP"])
+def shap_by_customer(customer_id: int, limit: int = Query(default=10, ge=1, le=50)):
+    """
+    Returns top SHAP features for a given customer_id,
+    sorted by absolute SHAP value descending.
+    """
+    engine = state.get("engine")
+    try:
+        with engine.connect() as conn:
+            exists = conn.execute(text(
+                "SELECT 1 FROM customers WHERE customer_id = :cid"
+            ), {"cid": customer_id}).fetchone()
+
+            if not exists:
+                raise HTTPException(status_code=404, detail=f"Customer {customer_id} not found.")
+
+            rows = conn.execute(text("""
+                SELECT feature_name, shap_value
+                FROM shap_features
+                WHERE customer_id = :cid
+                ORDER BY ABS(shap_value) DESC
+                LIMIT :limit
+            """), {"cid": customer_id, "limit": limit}).fetchall()
+
+        if not rows:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No SHAP values found for customer {customer_id}. Run shap_explainer.py first."
+            )
+
+        features = [
+            {
+                "feature":    r[0],
+                "shap_value": round(float(r[1]), 6),
+                "direction":  "increases_churn_risk" if r[1] > 0 else "decreases_churn_risk"
+            }
+            for r in rows
+        ]
+
+        churn_score = None
+        with engine.connect() as conn:
+            score_row = conn.execute(text(
+                "SELECT churn_risk_score, segment_label FROM customers WHERE customer_id = :cid"
+            ), {"cid": customer_id}).fetchone()
+            if score_row:
+                churn_score    = float(score_row[0]) if score_row[0] else None
+                segment_label  = score_row[1]
+
+        return {
+            "customer_id":      customer_id,
+            "churn_risk_score": churn_score,
+            "segment_label":    segment_label,
+            "top_features":     features,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── Reports ───────────────────────────────────────────────────────────────────
 
 @app.post("/reports/generate", tags=["Reports"])
 def generate_pdf_report(report_month: str = None):
