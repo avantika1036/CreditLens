@@ -5,7 +5,8 @@ CreditLens is a full-stack credit analytics platform that combines ML-based risk
 ---
 
 ## Architecture
-![alt text](image.png)
+<img width="768" height="512" alt="image" src="https://github.com/user-attachments/assets/68508a7d-765d-4337-9dc7-743cc5c645a7" />
+
 ---
 
 ## Tech Stack
